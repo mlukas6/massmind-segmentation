@@ -7,18 +7,22 @@ et al., 2023). Coursework for *Computer Vision — Assignment 2, FEUP 2025/26*.
 
 The assignment asks for two things: **(1)** a custom segmentation architecture
 proposed and defended by us, and **(2)** a comparison against at least one
-existing model trained on the same data. We're delivering this as:
+existing model trained on the same data. We deliver:
 
-- **Custom model — `VGG16UNetExt`:** ImageNet-pretrained VGG-16 encoder (same
-  pattern as the in-class demonstrator) wrapped in a hand-implemented decoder
-  with three individually-toggleable architectural modifications: an
-  Attention-Gate skip-refinement, a Transformer-Encoder bottleneck, and
-  deep-supervision auxiliary heads. Every decoder block, the attention gate,
-  the transformer body, and the aux-head supervision are built from
-  `torch.nn` primitives -- only the encoder backbone is borrowed.
-- **Existing-model baseline:** U-Net with the same ImageNet-pretrained VGG-16
-  encoder but SMP's default decoder (Nirgudkar et al.'s strongest CNN
-  baseline), trained on the same data with the same loss and metrics.
+- **Custom model — `CustomLWIRUNet`:** a from-scratch, deliberately
+  lightweight U-Net (~4.7 M parameters, ~52 GFLOPs) purpose-built for
+  single-channel LWIR. Depthwise-separable convolutions, GroupNorm, SiLU
+  activations, a Transformer-encoder bottleneck, and deep-supervision
+  auxiliary heads. Every block is built from `torch.nn` primitives — no
+  pretrained backbone. The design incorporates the findings of an earlier
+  architecture probe (`VGG16UNetExt`, see below).
+- **Existing-model baselines:** a U-Net with a VGG-16 encoder (SMP, Nirgudkar
+  et al.'s strongest CNN baseline) in two variants — **pretrained** on
+  ImageNet (the accuracy ceiling) and **from scratch** (the fair-capacity
+  comparison). Same data, same loss, same training scaffolding.
+
+The headline benchmark is a **three-way comparison at 50 epochs**, run
+end-to-end in the self-contained `notebooks/06_assignment_colab.ipynb`.
 
 ## Status
 
@@ -29,26 +33,85 @@ existing model trained on the same data. We're delivering this as:
 | U-Net + VGG-16 trainer (PyTorch; CUDA / MPS / CPU autodetect) | ✅ |
 | Augmentation pipelines A / B / C | ✅ |
 | Colab + Kaggle training notebooks | ✅ |
-| Baseline U-Net + VGG-16 runs for A / B / C on Kaggle, 20 ep | ✅ — `runs/kaggle_extract/` |
-| `VGG16UNetExt` custom model (`src/models/unet_vgg16_ext.py`) | ✅ |
+| `VGG16UNetExt` architecture probe (`base` / `att` / `trans` / `att_trans` / `trans_aux`) on T4 | ✅ — see "Architecture probe results" below |
 | Hand-implemented `AttentionGate`, `TransformerBottleneck`, aux heads | ✅ |
-| Focal loss (γ=2) + AdamW + cosine schedule | ✅ |
+| `CustomLWIRUNet` from-scratch model (`src/models/custom_lwir_unet.py`) | ✅ |
+| Hand-implemented `DepthwiseSeparableConv` / `DoubleDSConv` blocks (`src/models/_blocks.py`) | ✅ |
+| Focal loss (γ=2) + AdamW + cosine schedule + linear warmup | ✅ |
 | AMP (mixed precision) opt-in flag for CUDA | ✅ |
-| 2×2 architecture probe (`base` / `att` / `trans` / `att_trans`) on T4 | ✅ — see "Architecture probe results" below |
-| Deep-supervision probe (`trans_aux`) | ✅ |
-| ONNX export script for Netron visualisation | ✅ — `scripts/export_onnx.py` |
-| Final 50-epoch training run on full data (winner architecture) | ⏳ |
-| Threshold sweep (τ = 0.3 and 0.6) for rare-class F1 | ⏳ |
+| Self-contained assignment notebook (`notebooks/06_assignment_colab.ipynb`) | ✅ |
+| Final 50-epoch three-way run (`vgg16_pretrained` / `vgg16_scratch` / `custom_lwir`) | ✅ — see "Final results" below |
+| ONNX export of trained models (`scripts/export_runs_onnx.py`) | ✅ |
 | Final writeup | ⏳ |
 
-## Custom architecture (`VGG16UNetExt`)
+## Custom architecture (`CustomLWIRUNet`)
 
-The same encoder/decoder *pattern* as the in-class demonstrator (cell 30 of
-`12_Pytorch_SemanticSegmentation.ipynb`: pretrained VGG-16 sliced into
-encoder stages + hand-rolled `conv`/`up_conv` decoder helpers + skip
-concatenation), with three independently-toggleable modifications. Each
-modification is a flag on `build_unet_vgg16_ext()` so we can ablate them
-cleanly:
+`CustomLWIRUNet` (`src/models/custom_lwir_unet.py`) is the headline
+contribution: a from-scratch U-Net designed *for single-channel thermal
+imagery specifically*, not a shrunk copy of VGG-16. Every choice the 2015
+U-Net inherited from its era has been deliberately replaced. At **stem
+width 48** (channel multipliers `(1, 2, 4, 8, 8)` → widths
+`48, 96, 192, 384, 384`) it has **~4.7 M parameters** and **~52 GFLOPs** at
+the native 512×640 LWIR resolution — about **5× smaller and ~4.7× cheaper**
+than the VGG-16 baselines (~23.75 M params, ~247 GFLOPs).
+
+```
+[B, 1, H, W]
+  │
+  ▼  Stem (full res):      2× StandardConvBlock (1 → 48)            → skip0
+  ▼  Encoder stage 1:      MaxPool/2 + DoubleDSConv (48  → 96)      → skip1 (stride 2)
+  ▼  Encoder stage 2:      MaxPool/2 + DoubleDSConv (96  → 192)     → skip2 (stride 4)
+  ▼  Encoder stage 3:      MaxPool/2 + DoubleDSConv (192 → 384)     → skip3 (stride 8)
+  ▼  Encoder stage 4:      MaxPool/2 + DoubleDSConv (384 → 384)     → bottleneck in (stride 16)
+  ▼  Bottleneck:           TransformerBottleneck (384ch, 2 layers, 8 heads)
+  ▼  Decoder ×4:           ConvT/2 + concat skip + DoubleDSConv
+  ▼  Heads:                main 1×1 (48 → 7)  +  2 aux heads (training only)
+```
+
+Seven concrete departures from a standard U-Net:
+
+| Aspect | Standard U-Net | `CustomLWIRUNet` | Effect |
+|---|---|---|---|
+| Conv block | 3×3 Conv | `DepthwiseSeparableConv` (3×3 depthwise + 1×1 pointwise) | ~8× fewer params/FLOPs per block, same receptive field |
+| Normalisation | BatchNorm | GroupNorm (8 groups) | Batch-size-independent; works at batch=1 for deployment |
+| Activation | ReLU | SiLU (swish) | Smooth gradient, no dead-unit failure mode |
+| Bottleneck | DoubleConv | `TransformerBottleneck` (2 layers, 8 heads) | Global receptive field at the deepest stage |
+| Supervision | Single head | Main + 2 aux heads, weights 0.4 / 0.2 (training only) | Faster convergence, **zero** inference cost |
+| Width schedule | 64-128-256-512-1024 | 48-96-192-384-384 | 3× narrower at the bottleneck |
+| First layer | 3-ch RGB → adapted | Native 1-channel from epoch 0 | No pretrained-RGB feature baggage |
+
+Building blocks (`DepthwiseSeparableConv`, `StandardConvBlock`, `DoubleDSConv`)
+are hand-implemented in `src/models/_blocks.py`; the bottleneck reuses the
+same hand-implemented `TransformerBottleneck` from the probe. The stem uses a
+plain 3×3 conv because depthwise convolution is degenerate at 1 input
+channel. Aux heads are active only in `model.train()` — in `eval()` the
+forward returns a single tensor, so the deployed graph is exactly the
+~4.7 M-param / ~52-GFLOP model.
+
+**Why these choices**: depthwise-separable convs and a narrow width schedule
+keep the parameter/FLOP budget tiny; the Transformer bottleneck (the probe's
+strongest single contributor — see below) restores the global context a
+small conv stack would lack; deep-supervision aux heads accelerate
+convergence of a from-scratch model at no deployment cost. GroupNorm + SiLU
+are the modern, batch-size-robust replacements for BatchNorm + ReLU.
+
+> **Stem-width note:** an earlier `CustomLWIRUNet` used stem width 32
+> (~2.1 M params) but under-fitted the rare classes. Widening to 48
+> (~4.7 M) — every block scales quadratically with stem width — gave the
+> capacity headroom that closed most of the gap to the baselines.
+
+## Architecture probe (`VGG16UNetExt`)
+
+Before building `CustomLWIRUNet` from scratch we ran an **architecture
+probe**: which decoder-side modifications actually help on MassMIND? The
+probe model `VGG16UNetExt` reuses the same encoder/decoder *pattern* as the
+in-class demonstrator (cell 30 of `12_Pytorch_SemanticSegmentation.ipynb`:
+pretrained VGG-16 sliced into encoder stages + hand-rolled `conv`/`up_conv`
+decoder helpers + skip concatenation), with three independently-toggleable
+modifications. Each is a flag on `build_unet_vgg16_ext()` so we can ablate
+them cleanly. **The probe's findings directly determined `CustomLWIRUNet`'s
+design** (transformer bottleneck: keep; attention gates: drop; aux heads:
+keep).
 
 | Flag | Component | Status |
 |---|---|---|
@@ -172,21 +235,74 @@ Approx. parameter cost: ~5 K (negligible; two 1×1 convs of 512×7 and 256×7).
   the same data scale, with a simpler single-term formulation. Both `--loss
   focal` (default) and `--loss ce` are supported in `src/train.py`.
 - **Optimizer** — AdamW, `weight_decay = 1e-4`.
-- **Schedule** — `CosineAnnealingLR(T_max=epochs)` from `lr = 1e-4`.
-- **Epochs** — 10 for the architecture probe (this README's results); 50 for
-  the planned final training run on full data, matching the MassMIND paper.
-- **Batch size** — 8 on Kaggle T4 with AMP.
+- **Schedule** — `CosineAnnealingLR` from `lr = 1e-4`, with an optional
+  linear warmup (5 % of total steps) for the from-scratch configs
+  (`vgg16_scratch`, `custom_lwir`) where the early gradients are noisier.
+- **Epochs** — 10 for the `VGG16UNetExt` architecture probe; **50 for the
+  final three-way run** on full data, matching the MassMIND paper.
+- **Batch size** — 4 (the `06_assignment_colab.ipynb` default; drop to 2 on
+  Kaggle T4 if the VGG-16 configs OOM — Kaggle holds slightly more baseline
+  GPU memory than Colab).
 - **Mixed precision** — opt-in via `--amp` CLI flag (default off in
   `src/train.py` to preserve baseline numerics; default *on* in the probe
-  driver `scripts/probe_architectures.py`). Implementation: `torch.amp.autocast(fp16)`
+  driver and the assignment notebook). Implementation: `torch.amp.autocast(fp16)`
   + `GradScaler`, gated on `device.type == "cuda"` so the same code path is a
   no-op on CPU/MPS. Delivered ~2.5× speedup on Kaggle T4.
-- **Pretrained encoder** — yes, all `VGG16UNetExt` variants load ImageNet weights
-  through SMP and adapt the first conv from 3-ch RGB to 1-ch LWIR via channel-mean
-  initialisation in `src/models/_adapt.py`. Matches the pattern used by the
-  in-class demonstrator.
+- **Weight initialisation** — the two VGG-16 baselines build through SMP;
+  `vgg16_pretrained` loads ImageNet weights and adapts the first conv from
+  3-ch RGB to 1-ch LWIR via channel-mean initialisation (`src/models/_adapt.py`),
+  `vgg16_scratch` is randomly initialised. `CustomLWIRUNet` is trained
+  entirely from scratch (Kaiming init, no pretrained weights).
 - **Augmentations** — three pipelines defined in `src/augmentations.py`; see
   table below.
+
+## Final results
+
+Three-way comparison, **50 epochs**, full data (2042 train / 583 val),
+focal loss, AMP, Kaggle T4. Run end-to-end in
+`notebooks/06_assignment_colab.ipynb`. Validation every 5 epochs to fit the
+Kaggle session budget.
+
+| Config | Params | GFLOPs | best mIoU | best ep | train (min) |
+|---|---:|---:|---:|---:|---:|
+| `vgg16_pretrained` | 23.75 M | 247.16 | **0.8558** | 50 | 129.4 |
+| `vgg16_scratch` | 23.75 M | 247.16 | 0.8319 | 50 | 130.9 |
+| **`custom_lwir`** | **4.69 M** | **52.31** | **0.8095** | 50 | 254.7 |
+
+Per-class IoU at the best epoch:
+
+| Class | Pixel-% | `vgg16_pretrained` | `vgg16_scratch` | `custom_lwir` |
+|---|---:|---:|---:|---:|
+| sky | 30.3 | 0.987 | 0.985 | 0.981 |
+| water | 51.1 | 0.991 | 0.988 | 0.985 |
+| bridge | 1.6 | 0.745 | 0.692 | 0.650 |
+| obstacle | 0.9 | 0.730 | 0.675 | 0.637 |
+| living_obs | 0.05 | 0.685 | 0.657 | 0.629 |
+| background | 10.9 | 0.907 | 0.887 | 0.858 |
+| self | 3.1 | 0.947 | 0.938 | 0.928 |
+
+**Findings:**
+
+1. **`custom_lwir` reaches 95 % of the pretrained ceiling at 20 % of the
+   parameters and 21 % of the GFLOPs** — and 97 % of the from-scratch
+   baseline's mIoU. The gap to `vgg16_scratch` (the fair, equal-pretraining
+   comparison) is just **2.2 pp**.
+2. **The residual gap is concentrated in the minority classes** (`bridge`
+   −4.2 pp, `obstacle` −3.8 pp, `living_obs` −2.8 pp vs `vgg16_scratch`).
+   Dominant classes (`sky`, `water`, `self`) are effectively tied — a 5×
+   smaller model has 5× less capacity to spend on rare classes.
+3. **`living_obs` no longer collapses to 0.** Focal loss + 50 epochs lifts
+   it to 0.63–0.69 IoU across all three configs — the earlier 20-epoch
+   cross-entropy baseline's `living_obs = 0.000` failure mode is resolved
+   *without* a threshold sweep.
+4. **All three configs were still improving at epoch 50** (`best_epoch = 50`
+   everywhere) — none had plateaued. Extending to 80–100 epochs would lift
+   all three further, most of all `custom_lwir` (GroupNorm + depthwise nets
+   train slower per step).
+5. **FLOPs ≠ wall-clock on GPU.** `custom_lwir` has 4.7× fewer GFLOPs but
+   runs ~2× *slower* per epoch on the T4: depthwise convs bypass Tensor
+   Cores and are memory-bandwidth-bound. The efficiency win is real for
+   memory footprint and edge/CPU deployment, not for GPU latency.
 
 ## Architecture probe results
 
@@ -194,6 +310,7 @@ Five `VGG16UNetExt` configurations trained on Kaggle T4 with focal loss,
 600 training images, 10 epochs, AMP on the AMP runs. Same seed, same
 hyperparameters across all configs — the only thing that varies is the
 architecture flag combination. Probe driver: `scripts/probe_architectures.py`.
+These results determined `CustomLWIRUNet`'s design.
 
 | Config | Att. gates | Transformer | Aux heads | Precision | best mIoU | min/cfg |
 |---|:---:|:---:|:---:|---|---:|---:|
@@ -234,20 +351,17 @@ Per-class IoU at the best epoch:
    plateau at similar levels by epoch 10. Bridge gains most (+2.6 pp). Zero
    inference-time cost.
 
-**`living_obs` remains at 0.000 across all five configurations.** This is
-not an architecture problem — it's an argmax-decoding limitation at 0.05 %
-pixel share. Threshold sweep (τ=0.3 vs 0.6) is the planned next step;
-MassMIND paper reports UNet F1 16 → 54 from this single change.
+**`living_obs` stays at 0.000 across all five probe configurations.** At
+10 epochs with argmax decoding this 0.05 %-pixel class never wins an argmax.
+This was *not* an architecture limitation: the final 50-epoch runs (see
+"Final results" above) lift `living_obs` to 0.63–0.69 IoU on all three
+configs — longer training plus focal loss resolves it without a
+threshold-sweep decoding fix.
 
-### Planned remaining experiment matrix
-
-| # | Model | Aug | Epochs | Data | Purpose |
-|---|---|---|---|---|---|
-| 1 | `trans_aux` (winner) | A | 50 | full (2042 train) | Headline final number |
-| 2 | `trans_aux` | C (no-aug) | 50 | full | Assignment-required no-aug variant |
-| 3 | `trans_aux` | B (extended) | 50 | full | Own extension of MassMIND paper |
-| 4 | U-Net + VGG-16 (baseline) | A | 50 | full | Required comparison vs existing |
-| 5 | Threshold sweep (τ=0.3 vs 0.6) | — | — | best checkpoint | Rare-class F1 |
+The probe's verdict — **transformer bottleneck helps most, attention gates
+do not combine with it, aux heads accelerate convergence** — is what
+`CustomLWIRUNet` was built on: it keeps the transformer bottleneck and the
+aux heads, and omits the attention gates.
 
 ## Project layout
 
@@ -270,31 +384,36 @@ massmind_segmentation/
 │   └── models/
 │       ├── __init__.py                    # builder exports
 │       ├── _adapt.py                      # adapt first conv 3-ch → 1-ch via channel mean
-│       ├── unet.py                        # build_unet_vgg16 (SMP) — existing-model baseline
-│       ├── custom_unet.py                 # from-scratch hand-rolled U-Net (unused, kept for reference)
+│       ├── _blocks.py                     # DepthwiseSeparableConv / DoubleDSConv / StandardConvBlock
 │       ├── _attention_gate.py             # AttentionGate (Oktay 2018), hand-implemented
 │       ├── _transformer_bottleneck.py     # TransformerBottleneck, hand-implemented
-│       └── unet_vgg16_ext.py              # build_unet_vgg16_ext + VGG16UNetExt with three seams
+│       ├── unet.py                        # build_unet_vgg16 (SMP) — existing-model baseline
+│       ├── unet_vgg16_ext.py              # VGG16UNetExt — architecture-probe model
+│       ├── custom_lwir_unet.py            # CustomLWIRUNet — the headline custom model
+│       └── custom_unet.py                 # earlier from-scratch U-Net (kept for reference)
 ├── scripts/
 │   ├── download.py                        # idempotent Google-Drive download via gdown
-│   ├── probe_architectures.py             # runs the 2×2 architecture probe + aux variants
-│   └── export_onnx.py                     # exports any variant to ONNX for Netron
+│   ├── probe_architectures.py             # runs the VGG16UNetExt architecture probe
+│   ├── export_onnx.py                     # exports a VGG16UNetExt variant to ONNX (Netron)
+│   └── export_runs_onnx.py                # exports trained run checkpoints to ONNX
 ├── notebooks/
 │   ├── 01_data_exploration.ipynb          # class balance, image stats, sample renders
 │   ├── 02_train_colab.ipynb               # Colab/Kaggle driver: live tqdm + plots
-│   └── 03_probe_kaggle.ipynb              # dedicated probe notebook (T4 + AMP)
-├── kaggle_test_run_u_net.ipynb            # baseline run with embedded outputs
-├── kaggle_test_run_u_net_with_focal_loss.ipynb  # baseline + focal loss (0.80 mIoU)
+│   ├── 03_probe_kaggle.ipynb              # VGG16UNetExt probe notebook (T4 + AMP)
+│   ├── 04_sequential_runs.ipynb           # sequential multi-config training driver
+│   ├── 05_analysis.ipynb                  # cross-run comparison tables + plots
+│   └── 06_assignment_colab.ipynb          # SELF-CONTAINED assignment notebook (all code inlined)
 ├── 12_Pytorch_SemanticSegmentation.ipynb  # the in-class demonstrator (reference)
 ├── exports/                               # ONNX exports for Netron (gitignored, generated)
-├── runs/
-│   └── kaggle_extract/                    # baseline run artefacts: CSVs, logs, plots
-├── tests/                                 # pytest suite (80 tests)
+├── runs/                                  # one subdir per training run: config.json, metrics.csv, checkpoints
+│   └── analysis/                          # aggregated comparison tables + plots
+├── tests/                                 # pytest suite
 │   ├── test_dataset.py
 │   ├── test_metrics.py
 │   ├── test_models.py                     # CustomUNet + VGG16 builder + adaptation
 │   └── models/
-│       └── test_unet_vgg16_ext.py         # VGG16UNetExt + AttentionGate + TransformerBottleneck + aux
+│       ├── test_unet_vgg16_ext.py         # VGG16UNetExt + AttentionGate + TransformerBottleneck + aux
+│       └── test_custom_lwir_unet.py       # CustomLWIRUNet + DSConv blocks + param-count regression
 ├── requirements.txt
 └── .gitignore
 ```
@@ -321,19 +440,19 @@ python -m src.train \
 `src.train` autodetects device: CUDA → MPS → CPU. `--subset N` caps the
 training set to the first N images for fast iteration.
 
-To smoke-test the custom architecture variants instead of the SMP baseline:
+To smoke-test the models instead of the SMP baseline:
 
 ```bash
-# Plain VGG16UNetExt
+# CustomLWIRUNet — the headline custom model
+python -m src.train --model custom_lwir --loss focal --epochs 1 --subset 30
+
+# VGG16UNetExt probe model, plain
 python -m src.train --model vgg16_ext --epochs 1 --subset 30
 
-# With attention gates
-python -m src.train --model vgg16_ext --attention-gates --epochs 1 --subset 30
-
-# With transformer bottleneck
+# VGG16UNetExt with the transformer bottleneck
 python -m src.train --model vgg16_ext --transformer-bottleneck --epochs 1 --subset 30
 
-# Full stack (training-time aux heads), focal loss, AMP (CUDA-only)
+# VGG16UNetExt full stack (aux heads), focal loss, AMP (CUDA-only)
 python -m src.train --model vgg16_ext \
     --attention-gates --transformer-bottleneck --aux-heads \
     --loss focal --amp \
@@ -353,32 +472,53 @@ python scripts/probe_architectures.py --configs trans_aux      # just one
 python scripts/probe_architectures.py --no-amp                 # FP32 forced
 ```
 
-### ONNX export (for Netron visualisation)
+### ONNX export
+
+Two scripts, two purposes (both need `pip install onnx onnxscript onnxruntime`,
+not in `requirements.txt`):
+
+**`scripts/export_runs_onnx.py`** — export *trained* run checkpoints to ONNX
+for deployment (ONNX Runtime, TensorRT, mobile). Reads each
+`runs/<name>/checkpoint_best.pt`, exports `runs/<name>/model.onnx` (opset 18,
+dynamic batch + spatial axes, weights inlined into a single self-contained
+file), and verifies the export numerically against PyTorch:
 
 ```bash
-pip install onnx onnxscript  # optional, not in requirements.txt
-
-python scripts/export_onnx.py --output exports/base.onnx
-python scripts/export_onnx.py --transformer-bottleneck --output exports/trans.onnx
-python scripts/export_onnx.py \
-    --attention-gates --transformer-bottleneck --aux-heads --training-mode \
-    --output exports/full_training.onnx
+python scripts/export_runs_onnx.py                              # all three configs
+python scripts/export_runs_onnx.py --runs custom_lwir           # just one
+python scripts/export_runs_onnx.py --runs-dir runs --runs custom_kaggle scratch_kaggle
 ```
 
-Drop the `.onnx` file into <https://netron.app> to inspect the graph.
+**`scripts/export_onnx.py`** — export an *untrained* `VGG16UNetExt` variant
+purely for graph inspection in [netron.app](https://netron.app):
+
+```bash
+python scripts/export_onnx.py --transformer-bottleneck --output exports/trans.onnx
+```
+
+The `06_assignment_colab.ipynb` notebook also has a built-in ONNX export
+cell (section 8) that runs after training and writes the files into each
+run directory.
 
 ### Colab / Kaggle — full runs
 
-Two notebooks cover the two use cases:
-
+- **`notebooks/06_assignment_colab.ipynb`** — **the assignment deliverable.**
+  Fully self-contained: *only the dataset is downloaded*, every line of model,
+  data, and training code is inlined as notebook cells (no `git clone`). Runs
+  the complete three-way 50-epoch benchmark end-to-end, renders the full
+  results section (comparison table, Pareto plots, per-class IoU, convergence
+  curves, confusion matrices, qualitative predictions, FLOPs-vs-resolution),
+  and exports ONNX. Open in Colab or Kaggle → GPU (T4) → Run all. ~2.5–3 h.
+- **`notebooks/05_analysis.ipynb`** — cross-run comparison: reads `runs/*/`
+  artefacts and builds the comparison table + Pareto / per-class / convergence
+  plots. Runs on a laptop, no GPU.
 - **`notebooks/02_train_colab.ipynb`** — original baseline driver. Streams
   `src.train` stdout into a tqdm bar + live loss/mIoU plot, optional Drive
   sync. One augmentation per cell.
-- **`notebooks/03_probe_kaggle.ipynb`** — dedicated architecture-probe
-  notebook for Kaggle. Self-contained: clones repo, installs deps, downloads
-  data, runs `scripts/probe_architectures.py`, plots training curves and a
-  per-class IoU table for every config in one go. Designed for headless
-  "Save Version → Save & Run All".
+- **`notebooks/03_probe_kaggle.ipynb`** / **`04_sequential_runs.ipynb`** —
+  the `VGG16UNetExt` architecture-probe notebooks for Kaggle. Clone repo,
+  install deps, download data, run `scripts/probe_architectures.py`, plot
+  per-config training curves. Designed for headless "Save & Run All".
 
 **Kaggle tips** (lessons learned the hard way):
 
@@ -416,11 +556,11 @@ LWIR image (640×512, 8 or 16 bit)
                                                 │
                                                 ▼
                                 ┌──────────────────────────────┐
-                                │ VGG16UNetExt (custom)  OR    │
-                                │ U-Net + VGG-16 (baseline)    │
+                                │ CustomLWIRUNet (custom)  OR   │
+                                │ U-Net + VGG-16 (baseline)     │
                                 └──────────────────────────────┘
                                                 │
-                                                ▼ argmax  (or τ-threshold for rare classes)
+                                                ▼ argmax
                                        per-pixel class ID ∈ [0..6]
                                                 │
                                                 ▼
@@ -457,10 +597,11 @@ Two things deliberately excluded from all three pipelines:
   pipeline B's mild noise injection alone was enough to wipe out the
   `obstacle` class in the baseline runs (see Results).
 
-## Baseline results — U-Net + VGG-16, 20 epochs, P100
+## Early baseline runs — U-Net + VGG-16, 20 epochs, cross-entropy
 
-These are the *baseline* (existing-model) runs that confirm the pipeline
-works end-to-end. From `runs/kaggle_extract/summary.csv`:
+These are the **earliest pipeline-validation runs** (cross-entropy loss,
+20 epochs) — superseded by the "Final results" above, but kept because two
+of their findings shaped later decisions. From `runs/kaggle_extract/summary.csv`:
 
 | Aug | best ep | val mIoU | sky | water | bridge | obstacle | **living_obs** | background | self |
 |-----|---------|----------|-------|-------|--------|----------|----------------|------------|------|
@@ -470,18 +611,17 @@ works end-to-end. From `runs/kaggle_extract/summary.csv`:
 
 Two findings, both **consistent with the MassMIND paper**:
 
-1. **`living_obs` IoU collapses to exactly 0** with plain cross-entropy and
-   `argmax` decoding. The class is 1/2000 as common as water; gradients never
-   push a logit high enough to win an `argmax`. The paper hit the same wall —
-   their UNet got F1 = 16.1 at τ = 0.6, but F1 = 54.5 at τ = 0.3. Signal is in
-   the logits; argmax discards it. Our `trans_aux` config (focal loss +
-   transformer bottleneck + deep-supervision aux heads) is designed to push
-   the logits in the right direction; the threshold sweep at τ=0.3 is the
-   complementary decoding-side fix.
+1. **`living_obs` IoU collapsed to exactly 0** with plain cross-entropy at
+   20 epochs. The class is ~1/2000 as common as water; CE gradient is
+   dominated by the easy majority and never pushes the rare logit high
+   enough to win an `argmax`. **This drove the switch to focal loss** — and
+   the final 50-epoch focal-loss runs lift `living_obs` to 0.63–0.69 IoU on
+   all three configs (see "Final results"), so the planned τ-threshold
+   decoding fix turned out to be unnecessary.
 2. **Pipeline B destroys the `obstacle` class** (0.666 → 0.00008). Even
-   modest photometric perturbations break LWIR. The MassMIND paper's
-   Section 5 explicitly warns against brightness jitter; our Run 4-equivalent
-   reproduces the failure mode.
+   modest photometric perturbations break LWIR — the MassMIND paper's
+   Section 5 explicitly warns against brightness jitter. This is why the
+   final runs use Pipeline A (geometric-only augmentation).
 
 A and C land within 0.005 mIoU of each other for the baseline, suggesting the
 geometric augmentations in A add little over plain normalisation when training
@@ -496,14 +636,18 @@ Required by the assignment:
 - **Recall** per class
 - **Total parameter count** and **trainable parameter count**
 
-Additional, for stronger comparison with the MassMIND paper:
+Additional, reported in `06_assignment_colab.ipynb`'s results section:
 
-- **F1 per class** (the paper's headline metric)
-- **Per-class results at two thresholds: τ = 0.6 (standard) and τ = 0.3 (rare-class)**
-- **Training time per epoch** and **inference time per image**
+- **Pixel accuracy** and per-class IoU at the best epoch
+- **Forward-pass GFLOPs** at the native 512×640 resolution, and a
+  compute-vs-resolution sensitivity sweep
+- **Per-class confusion matrices** (one per config)
+- **Training time per epoch** (logged to each run's `metrics.csv`)
 
-Metrics are computed via the `ConfusionMatrixTracker` in `src/metrics.py`
-with per-class breakdown and a macro aggregate.
+Metrics are computed via the `ConfusionMatrixTracker` in `src/metrics.py` —
+a streaming confusion matrix accumulated over the full validation pass,
+giving exact dataset-level IoU (`TP / (TP + FP + FN)`) per class plus a
+macro aggregate.
 
 ## Tests
 
@@ -511,7 +655,7 @@ with per-class breakdown and a macro aggregate.
 pytest tests/ -q
 ```
 
-80 tests, ~30 s on a laptop. Covers:
+106 tests, ~10 s on a laptop. Covers:
 
 - Dataset loading + augmentation invariants (`test_dataset.py`)
 - `ConfusionMatrixTracker` correctness (`test_metrics.py`)
@@ -521,6 +665,9 @@ pytest tests/ -q
   DoubleConv vs TransformerBottleneck), pretrained channel-mean adaptation,
   deep-supervision tuple-vs-tensor output dispatch, determinism
   (`tests/models/test_unet_vgg16_ext.py`)
+- `CustomLWIRUNet` + depthwise-separable blocks: forward/backward, train-vs-eval
+  output dispatch (3-tuple vs single tensor), GroupNorm group-count safety,
+  and a parameter-count regression guard (`tests/models/test_custom_lwir_unet.py`)
 
 ## References
 
@@ -540,4 +687,11 @@ pytest tests/ -q
 - Zhao, H. et al. (2017). *Pyramid Scene Parsing Network (PSPNet).* CVPR.
 - Zhou, Z. et al. (2018). *UNet++: A Nested U-Net Architecture for Medical
   Image Segmentation.* DLMIA.
+- Howard, A. et al. (2017). *MobileNets: Efficient Convolutional Neural
+  Networks for Mobile Vision Applications.* arXiv:1704.04861. — depthwise-
+  separable convolutions, the core of `CustomLWIRUNet`'s efficiency.
+- Wu, Y., He, K. (2018). *Group Normalization.* ECCV. — the batch-size-
+  independent normaliser used throughout `CustomLWIRUNet`.
+- Elfwing, S., Uchibe, E., Doya, K. (2018). *Sigmoid-Weighted Linear Units
+  (SiLU).* Neural Networks. — the activation used throughout `CustomLWIRUNet`.
 - Upstream MassMIND repository: <https://github.com/uml-marine-robotics/MassMIND>
